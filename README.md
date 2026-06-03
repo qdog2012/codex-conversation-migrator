@@ -5,6 +5,7 @@ A local Codex conversation migration tool for exporting, importing, merging, and
 This utility works with the local Codex data directory (`CODEX_HOME` or `~/.codex`). It can:
 
 - Export all local Codex conversations from all `model_provider` values.
+- Optionally export complete project/workspace directories referenced by conversations.
 - Import conversations into another machine and rewrite them to a target provider such as `openai`.
 - Merge duplicate thread IDs safely when importing the same conversation more than once.
 - Rewrite existing local conversations from one provider to another, such as `crs` to `openai`.
@@ -28,6 +29,14 @@ python codex_conversation_migrator.py export --output codex-conversations.zip
 
 The export package includes local conversation files and metadata from all providers.
 
+To also include complete project/workspace directories referenced by conversations:
+
+```powershell
+python codex_conversation_migrator.py export --output codex-conversations.zip --include-workspaces
+```
+
+> Warning: `--include-workspaces` copies complete project directories with no exclusion rules. Review the package for secrets, large files, build outputs, dependencies, databases, and private data before sharing it.
+
 ### Import into the target machine
 
 Open Codex App once on the target machine, log in, then close Codex App before importing.
@@ -37,6 +46,20 @@ python codex_conversation_migrator.py import codex-conversations.zip openai
 ```
 
 All imported conversations are rewritten to the target provider (`openai` in this example), so they can appear under that provider's local conversation list.
+
+If the package includes project/workspace directories, they are restored by default under:
+
+```text
+~/.codex/imported_workspaces/<package-name>/
+```
+
+Imported thread metadata is updated so `cwd` points to the restored project directory on the target machine.
+
+To choose a restore location:
+
+```powershell
+python codex_conversation_migrator.py import codex-conversations.zip openai --restore-workspaces-to D:\CodexImportedProjects
+```
 
 ### Merge behavior
 
@@ -106,6 +129,7 @@ The script may read or write:
 - `session_index.jsonl`
 - `.codex-global-state.json`
 - `config.toml`
+- `imported_workspaces/` when importing a package that includes project directories
 
 It does not copy or modify login credential files such as `auth.json`.
 
@@ -116,4 +140,3 @@ If something looks wrong after import or migration:
 1. Close Codex App.
 2. Restore the latest backup from `~/.codex/migration_backups/`.
 3. Reopen Codex App.
-

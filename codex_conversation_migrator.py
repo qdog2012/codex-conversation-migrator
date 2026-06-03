@@ -5,17 +5,21 @@ machine under a chosen model_provider value.
 
 Examples:
     # Same machine: rewrite all local conversations from "crs" to "openai".
-    python migrate_codex_provider.py migrate crs openai
+    python codex_conversation_migrator.py migrate crs openai
     # Backward-compatible shorthand:
-    python migrate_codex_provider.py crs openai
+    python codex_conversation_migrator.py crs openai
 
     # Source machine: export all local conversations from all providers.
-    python migrate_codex_provider.py export --output codex-conversations.zip
+    python codex_conversation_migrator.py export --output codex-conversations.zip
+    # Include complete project/workspace directories too. No files are excluded.
+    python codex_conversation_migrator.py export --output codex-conversations.zip --include-workspaces
 
     # Target machine: import the package and make all imported conversations
     # visible under the "openai" provider. Duplicate thread ids are merged by
     # default; use --overwrite to replace or --skip-existing to skip them.
-    python migrate_codex_provider.py import codex-conversations.zip openai
+    python codex_conversation_migrator.py import codex-conversations.zip openai
+    # Choose where packaged project/workspace directories are restored.
+    python codex_conversation_migrator.py import codex-conversations.zip openai --restore-workspaces-to D:\\CodexImportedProjects
 
 The script uses CODEX_HOME when set; otherwise it uses ~/.codex.
 Close Codex App before export/import for the cleanest result.
@@ -32,6 +36,7 @@ import sqlite3
 import sys
 import tempfile
 import zipfile
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -45,6 +50,7 @@ BACKUP_FILES = (
     ".codex-global-state.json",
     "config.toml",
 )
+WORKSPACE_MANIFEST = "workspace_manifest.json"
 
 
 def safe_name(value: str) -> str:
@@ -75,6 +81,14 @@ def as_db_path(path: Path) -> str:
     return resolved
 
 
+def path_from_db(value: Any) -> Path | None:
+    if not isinstance(value, str) or not value:
+        return None
+    if value.startswith("\\\\?\\"):
+        value = value[4:]
+    return Path(value).expanduser()
+
+
 def read_first_json(path: Path) -> dict[str, Any] | None:
     try:
         with path.open("r", encoding="utf-8") as handle:
@@ -93,7 +107,9 @@ def read_session_meta(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def write_session_provider(src: Path, dst: Path, provider: str) -> bool:
+def write_session_provider(
+    src: Path, dst: Path, provider: str, cwd: Path | None = None
+) -> bool:
     try:
         with src.open("r", encoding="utf-8") as handle:
             first_line = handle.readline()
@@ -105,6 +121,8 @@ def write_session_provider(src: Path, dst: Path, provider: str) -> bool:
     payload = obj.get("payload")
     if obj.get("type") == "session_meta" and isinstance(payload, dict):
         payload["model_provider"] = provider
+        if cwd is not None:
+            payload["cwd"] = as_db_path(cwd)
 
     dst.parent.mkdir(parents=True, exist_ok=True)
     with dst.open("w", encoding="utf-8", newline="") as handle:
@@ -124,14 +142,16 @@ def canonical_event_line(line: str) -> str:
     return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def merge_session_provider(src: Path, dst: Path, provider: str) -> tuple[bool, int]:
+def merge_session_provider(
+    src: Path, dst: Path, provider: str, cwd: Path | None = None
+) -> tuple[bool, int]:
     """Merge src into existing dst and rewrite the session_meta provider.
 
     Returns (changed, appended_line_count). If dst does not exist, this behaves
     like a copy with provider rewrite.
     """
     if not dst.exists():
-        return (write_session_provider(src, dst, provider), 0)
+        return (write_session_provider(src, dst, provider, cwd), 0)
 
     try:
         src_lines = src.read_text(encoding="utf-8").splitlines()
@@ -139,19 +159,22 @@ def merge_session_provider(src: Path, dst: Path, provider: str) -> tuple[bool, i
         src_obj = json.loads(src_lines[0]) if src_lines else {}
         dst_obj = json.loads(dst_lines[0]) if dst_lines else {}
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return (write_session_provider(src, dst, provider), 0)
+        return (write_session_provider(src, dst, provider, cwd), 0)
 
     if not src_lines:
         return (False, 0)
 
     if not dst_lines:
-        return (write_session_provider(src, dst, provider), 0)
+        return (write_session_provider(src, dst, provider, cwd), 0)
 
     first_obj = dst_obj if isinstance(dst_obj, dict) else src_obj
     payload = first_obj.get("payload")
     existing_provider = payload.get("model_provider") if isinstance(payload, dict) else None
+    existing_cwd = payload.get("cwd") if isinstance(payload, dict) else None
     if first_obj.get("type") == "session_meta" and isinstance(payload, dict):
         payload["model_provider"] = provider
+        if cwd is not None:
+            payload["cwd"] = as_db_path(cwd)
 
     body = list(dst_lines[1:])
     seen = {canonical_event_line(line) for line in body}
@@ -166,6 +189,8 @@ def merge_session_provider(src: Path, dst: Path, provider: str) -> tuple[bool, i
     stat_src = src.stat()
     stat_dst = dst.stat()
     changed = appended > 0 or existing_provider != provider
+    if cwd is not None:
+        changed = changed or existing_cwd != as_db_path(cwd)
     if changed:
         dst.parent.mkdir(parents=True, exist_ok=True)
         text = json.dumps(first_obj, ensure_ascii=False, separators=(",", ":"))
@@ -272,6 +297,78 @@ def collect_session_files(base: Path) -> dict[str, tuple[str, Path]]:
     return sessions
 
 
+def workspace_id_for_path(path: Path) -> str:
+    digest = hashlib.sha256(str(path.resolve()).lower().encode("utf-8")).hexdigest()
+    return digest[:16]
+
+
+def collect_thread_cwds(base: Path) -> dict[str, Path]:
+    db = base / "state_5.sqlite"
+    if not db.exists():
+        return {}
+
+    con = connect_ro(db)
+    try:
+        if not table_exists(con, "threads"):
+            return {}
+        result: dict[str, Path] = {}
+        for thread_id, cwd in con.execute("select id, cwd from threads"):
+            path = path_from_db(cwd)
+            if isinstance(thread_id, str) and path is not None and path.is_dir():
+                result[thread_id] = path.resolve()
+        return result
+    finally:
+        con.close()
+
+
+def export_workspaces(base: Path, stage: Path) -> tuple[list[dict[str, Any]], int]:
+    thread_cwds = collect_thread_cwds(base)
+    by_workspace: dict[Path, list[str]] = {}
+    for thread_id, cwd in thread_cwds.items():
+        by_workspace.setdefault(cwd, []).append(thread_id)
+
+    entries: list[dict[str, Any]] = []
+    copied = 0
+    workspaces_dir = stage / "workspaces"
+    for cwd, thread_ids in sorted(by_workspace.items(), key=lambda item: str(item[0])):
+        workspace_id = workspace_id_for_path(cwd)
+        target_dir_name = f"{safe_name(cwd.name)}-{workspace_id}"
+        package_path = Path("workspaces") / target_dir_name
+        dst = stage / package_path
+        shutil.copytree(cwd, dst)
+        copied += 1
+        entries.append(
+            {
+                "workspace_id": workspace_id,
+                "source_path": str(cwd),
+                "package_path": package_path.as_posix(),
+                "target_dir_name": target_dir_name,
+                "thread_ids": sorted(thread_ids),
+            }
+        )
+
+    if copied == 0 and workspaces_dir.exists():
+        workspaces_dir.rmdir()
+
+    if entries:
+        (stage / WORKSPACE_MANIFEST).write_text(
+            json.dumps({"workspaces": entries}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    return entries, copied
+
+
+def load_workspace_entries(package: Path) -> list[dict[str, Any]]:
+    manifest = load_json_file(package / WORKSPACE_MANIFEST)
+    entries = manifest.get("workspaces")
+    return entries if isinstance(entries, list) else []
+
+
+def default_workspace_restore_root(base: Path, package_zip: Path) -> Path:
+    return base / "imported_workspaces" / safe_name(package_zip.stem)
+
+
 def make_target_backup(base: Path, label: str) -> Path:
     backup_dir = base / "migration_backups" / f"{label}-{now_stamp()}"
     backup_dir.mkdir(parents=True, exist_ok=False)
@@ -306,6 +403,13 @@ def create_export(args: argparse.Namespace) -> int:
         output = output.with_suffix(".zip")
     output.parent.mkdir(parents=True, exist_ok=True)
 
+    if args.include_workspaces:
+        print(
+            "WARNING: --include-workspaces copies complete project directories "
+            "with no exclusion rules. Review for secrets, large files, build "
+            "outputs, dependencies, and private data before sharing the package."
+        )
+
     with tempfile.TemporaryDirectory(prefix="codex-export-") as temp_name:
         stage = Path(temp_name) / "package"
         stage.mkdir(parents=True)
@@ -322,11 +426,18 @@ def create_export(args: argparse.Namespace) -> int:
             if path.exists() and path.is_file():
                 shutil.copy2(path, stage / name)
 
+        workspace_entries: list[dict[str, Any]] = []
+        workspace_count = 0
+        if args.include_workspaces:
+            workspace_entries, workspace_count = export_workspaces(base, stage)
+
         manifest = {
             "format": PACKAGE_FORMAT,
             "created_at": utc_now_iso(),
             "source_codex_home": str(base),
             "session_file_count": copied_files,
+            "include_workspaces": bool(args.include_workspaces),
+            "workspace_count": workspace_count,
             "provider_counts_from_state": provider_counts_from_state(
                 stage / "state_5.sqlite"
             ),
@@ -341,6 +452,8 @@ def create_export(args: argparse.Namespace) -> int:
         shutil.make_archive(str(output.with_suffix("")), "zip", root_dir=stage)
 
     print(f"Exported: {output}")
+    if args.include_workspaces:
+        print(f"Project directories included: {len(workspace_entries)}")
     print("Providers in state DB:")
     for provider, count in provider_counts_from_state_from_zip(output).items():
         print(f"  {provider or '<empty>'}: {count}")
@@ -572,7 +685,12 @@ def append_or_merge_session_index(
     return changed
 
 
-def merge_global_state(base: Path, package: Path, imported_ids: set[str]) -> int:
+def merge_global_state(
+    base: Path,
+    package: Path,
+    imported_ids: set[str],
+    id_to_cwd_path: dict[str, Path] | None = None,
+) -> int:
     if not imported_ids:
         return 0
 
@@ -606,8 +724,13 @@ def merge_global_state(base: Path, package: Path, imported_ids: set[str]) -> int
         if not isinstance(dst_map, dict):
             dst[key] = dst_map = {}
         for thread_id in imported_ids:
-            if thread_id in src_map and dst_map.get(thread_id) != src_map[thread_id]:
-                dst_map[thread_id] = src_map[thread_id]
+            if thread_id not in src_map and key != "thread-workspace-root-hints":
+                continue
+            value = src_map.get(thread_id)
+            if key == "thread-workspace-root-hints" and id_to_cwd_path and thread_id in id_to_cwd_path:
+                value = as_db_path(id_to_cwd_path[thread_id])
+            if value is not None and dst_map.get(thread_id) != value:
+                dst_map[thread_id] = value
                 changed += 1
 
     if changed:
@@ -684,6 +807,7 @@ def import_threads(
     source_db: Path,
     imported_ids: set[str],
     id_to_rollout_path: dict[str, Path],
+    id_to_cwd_path: dict[str, Path],
     target_provider: str,
     mode: str,
 ) -> tuple[int, int, int]:
@@ -724,6 +848,8 @@ def import_threads(
                     values = current_values
             if "model_provider" in cols:
                 values[cols.index("model_provider")] = target_provider
+            if "cwd" in cols and thread_id in id_to_cwd_path:
+                values[cols.index("cwd")] = as_db_path(id_to_cwd_path[thread_id])
             if "rollout_path" in cols and thread_id in id_to_rollout_path:
                 values[cols.index("rollout_path")] = as_db_path(id_to_rollout_path[thread_id])
             target.execute(insert_sql, values)
@@ -820,6 +946,33 @@ def set_config_provider(base: Path, provider: str) -> bool:
     return False
 
 
+def restore_workspace_for_entry(
+    package: Path,
+    restore_root: Path,
+    entry: dict[str, Any],
+    restored_cache: dict[str, Path],
+) -> Path | None:
+    workspace_id = entry.get("workspace_id")
+    package_path = entry.get("package_path")
+    target_dir_name = entry.get("target_dir_name")
+    if not isinstance(workspace_id, str) or not isinstance(package_path, str):
+        return None
+    if not isinstance(target_dir_name, str) or not target_dir_name:
+        target_dir_name = workspace_id
+    if workspace_id in restored_cache:
+        return restored_cache[workspace_id]
+
+    src = package / package_path
+    if not src.is_dir():
+        return None
+
+    dst = restore_root / target_dir_name
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src, dst, dirs_exist_ok=True)
+    restored_cache[workspace_id] = dst.resolve()
+    return restored_cache[workspace_id]
+
+
 def import_package(args: argparse.Namespace) -> int:
     base = codex_home(args.codex_home)
     if not base.exists():
@@ -857,6 +1010,22 @@ def import_package(args: argparse.Namespace) -> int:
         source_sessions = collect_session_files(package)
         target_sessions = collect_session_files(base)
         target_ids = set(target_sessions)
+        workspace_entries = load_workspace_entries(package)
+        workspace_by_thread: dict[str, dict[str, Any]] = {}
+        for entry in workspace_entries:
+            thread_ids = entry.get("thread_ids")
+            if not isinstance(thread_ids, list):
+                continue
+            for thread_id in thread_ids:
+                if isinstance(thread_id, str):
+                    workspace_by_thread[thread_id] = entry
+
+        workspace_restore_root = (
+            Path(args.restore_workspaces_to).expanduser().resolve()
+            if args.restore_workspaces_to
+            else default_workspace_restore_root(base, package_zip)
+        )
+        restored_workspaces: dict[str, Path] = {}
 
         imported_ids: set[str] = set()
         skipped_existing = 0
@@ -864,13 +1033,24 @@ def import_package(args: argparse.Namespace) -> int:
         merged_files = 0
         overwritten_files = 0
         merged_event_lines = 0
+        workspace_restored_threads = 0
         id_to_rollout_path: dict[str, Path] = {}
+        id_to_cwd_path: dict[str, Path] = {}
 
         for thread_id, (dirname, src_path) in source_sessions.items():
             exists = thread_id in target_ids
             if exists and mode == "skip":
                 skipped_existing += 1
                 continue
+
+            cwd_path = None
+            workspace_entry = workspace_by_thread.get(thread_id)
+            if workspace_entry is not None:
+                cwd_path = restore_workspace_for_entry(
+                    package, workspace_restore_root, workspace_entry, restored_workspaces
+                )
+                if cwd_path is not None:
+                    workspace_restored_threads += 1
 
             if exists:
                 dst_path = target_sessions[thread_id][1]
@@ -879,27 +1059,33 @@ def import_package(args: argparse.Namespace) -> int:
                 dst_path = base / dirname / rel
 
             if mode == "overwrite":
-                ok = write_session_provider(src_path, dst_path, args.target_provider)
+                ok = write_session_provider(
+                    src_path, dst_path, args.target_provider, cwd_path
+                )
                 if exists and ok:
                     overwritten_files += 1
                 elif ok:
                     copied_files += 1
             elif mode == "merge" and exists:
                 changed, appended = merge_session_provider(
-                    src_path, dst_path, args.target_provider
+                    src_path, dst_path, args.target_provider, cwd_path
                 )
                 ok = dst_path.exists()
                 if ok:
                     merged_files += 1
                     merged_event_lines += appended
             else:
-                ok = write_session_provider(src_path, dst_path, args.target_provider)
+                ok = write_session_provider(
+                    src_path, dst_path, args.target_provider, cwd_path
+                )
                 if ok:
                     copied_files += 1
 
             if ok:
                 imported_ids.add(thread_id)
                 id_to_rollout_path[thread_id] = dst_path
+                if cwd_path is not None:
+                    id_to_cwd_path[thread_id] = cwd_path
 
         source_db = package / "state_5.sqlite"
         if not source_db.exists():
@@ -910,6 +1096,7 @@ def import_package(args: argparse.Namespace) -> int:
             source_db,
             imported_ids,
             id_to_rollout_path,
+            id_to_cwd_path,
             args.target_provider,
             mode,
         )
@@ -927,7 +1114,9 @@ def import_package(args: argparse.Namespace) -> int:
             imported_ids,
             mode,
         )
-        global_changes = merge_global_state(base, package, imported_ids)
+        global_changes = merge_global_state(
+            base, package, imported_ids, id_to_cwd_path
+        )
 
     config_changed = False
     if not args.no_set_config:
@@ -945,6 +1134,11 @@ def import_package(args: argparse.Namespace) -> int:
     print(f"New event lines appended during merge: {merged_event_lines}")
     print(f"Existing session files overwritten: {overwritten_files}")
     print(f"Existing thread IDs skipped: {skipped_existing}")
+    print(f"Project directories in package: {len(workspace_entries)}")
+    print(f"Project directories restored: {len(restored_workspaces)}")
+    print(f"Threads mapped to restored project directories: {workspace_restored_threads}")
+    if restored_workspaces:
+        print(f"Project restore root: {workspace_restore_root}")
     print(f"Thread rows imported: {thread_rows}")
     print(f"Dynamic tool rows imported: {dynamic_rows}")
     print(f"Spawn edge rows imported: {edge_rows}")
@@ -992,6 +1186,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--output",
         help="Output zip path. Defaults to ./codex-conversations-<timestamp>.zip.",
     )
+    export_parser.add_argument(
+        "--include-workspaces",
+        action="store_true",
+        help=(
+            "Also package complete project/workspace directories referenced by "
+            "threads. No files are excluded."
+        ),
+    )
     export_parser.set_defaults(func=create_export)
 
     import_parser = subparsers.add_parser(
@@ -1005,6 +1207,13 @@ def build_parser() -> argparse.ArgumentParser:
     import_parser.add_argument(
         "--codex-home",
         help="Target Codex home. Defaults to CODEX_HOME or ~/.codex.",
+    )
+    import_parser.add_argument(
+        "--restore-workspaces-to",
+        help=(
+            "Directory where packaged project/workspace directories should be "
+            "restored. Defaults to ~/.codex/imported_workspaces/<package-name>."
+        ),
     )
     import_parser.add_argument(
         "--overwrite",
