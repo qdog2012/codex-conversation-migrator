@@ -10,9 +10,10 @@ Examples:
     python codex_conversation_migrator.py crs openai
 
     # Source machine: export all local conversations from all providers.
+    # Project/workspace directories are included by default.
     python codex_conversation_migrator.py export --output codex-conversations.zip
-    # Include complete project/workspace directories too. No files are excluded.
-    python codex_conversation_migrator.py export --output codex-conversations.zip --include-workspaces
+    # Skip packaging project/workspace directories.
+    python codex_conversation_migrator.py export --output codex-conversations.zip --skip-workspaces
 
     # Target machine: import the package and make all imported conversations
     # visible under the "openai" provider. Duplicate thread ids are merged by
@@ -403,11 +404,13 @@ def create_export(args: argparse.Namespace) -> int:
         output = output.with_suffix(".zip")
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    if args.include_workspaces:
+    include_workspaces = not args.skip_workspaces
+    if include_workspaces:
         print(
-            "WARNING: --include-workspaces copies complete project directories "
-            "with no exclusion rules. Review for secrets, large files, build "
-            "outputs, dependencies, and private data before sharing the package."
+            "WARNING: project/workspace directories are included by default and "
+            "are copied with no exclusion rules. Review for secrets, large files, "
+            "build outputs, dependencies, and private data before sharing the "
+            "package. Use --skip-workspaces to export conversations only."
         )
 
     with tempfile.TemporaryDirectory(prefix="codex-export-") as temp_name:
@@ -428,7 +431,7 @@ def create_export(args: argparse.Namespace) -> int:
 
         workspace_entries: list[dict[str, Any]] = []
         workspace_count = 0
-        if args.include_workspaces:
+        if include_workspaces:
             workspace_entries, workspace_count = export_workspaces(base, stage)
 
         manifest = {
@@ -436,7 +439,7 @@ def create_export(args: argparse.Namespace) -> int:
             "created_at": utc_now_iso(),
             "source_codex_home": str(base),
             "session_file_count": copied_files,
-            "include_workspaces": bool(args.include_workspaces),
+            "include_workspaces": bool(include_workspaces),
             "workspace_count": workspace_count,
             "provider_counts_from_state": provider_counts_from_state(
                 stage / "state_5.sqlite"
@@ -452,7 +455,7 @@ def create_export(args: argparse.Namespace) -> int:
         shutil.make_archive(str(output.with_suffix("")), "zip", root_dir=stage)
 
     print(f"Exported: {output}")
-    if args.include_workspaces:
+    if include_workspaces:
         print(f"Project directories included: {len(workspace_entries)}")
     print("Providers in state DB:")
     for provider, count in provider_counts_from_state_from_zip(output).items():
@@ -1187,12 +1190,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output zip path. Defaults to ./codex-conversations-<timestamp>.zip.",
     )
     export_parser.add_argument(
-        "--include-workspaces",
+        "--skip-workspaces",
         action="store_true",
         help=(
-            "Also package complete project/workspace directories referenced by "
-            "threads. No files are excluded."
+            "Do not package project/workspace directories. By default they are "
+            "included with no exclusion rules."
         ),
+    )
+    export_parser.add_argument(
+        "--include-workspaces",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     export_parser.set_defaults(func=create_export)
 

@@ -5,7 +5,7 @@ A local Codex conversation migration tool for exporting, importing, merging, and
 This utility works with the local Codex data directory (`CODEX_HOME` or `~/.codex`). It can:
 
 - Export all local Codex conversations from all `model_provider` values.
-- Optionally export complete project/workspace directories referenced by conversations.
+- Export complete project/workspace directories referenced by conversations by default.
 - Import conversations into another machine and rewrite them to a target provider such as `openai`.
 - Merge duplicate thread IDs safely when importing the same conversation more than once.
 - Rewrite existing local conversations from one provider to another, such as `crs` to `openai`.
@@ -27,15 +27,15 @@ No third-party Python packages are required.
 python codex_conversation_migrator.py export --output codex-conversations.zip
 ```
 
-The export package includes local conversation files and metadata from all providers.
+The export package includes local conversation files, metadata from all providers, and complete project/workspace directories referenced by conversations.
 
-To also include complete project/workspace directories referenced by conversations:
+Project/workspace directories are copied with no exclusion rules. Review the package for secrets, large files, build outputs, dependencies, databases, and private data before sharing it.
+
+To export conversations only and skip project/workspace directories:
 
 ```powershell
-python codex_conversation_migrator.py export --output codex-conversations.zip --include-workspaces
+python codex_conversation_migrator.py export --output codex-conversations.zip --skip-workspaces
 ```
-
-> Warning: `--include-workspaces` copies complete project directories with no exclusion rules. Review the package for secrets, large files, build outputs, dependencies, databases, and private data before sharing it.
 
 ### Import into the target machine
 
