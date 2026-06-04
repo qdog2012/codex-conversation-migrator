@@ -22,8 +22,12 @@ Examples:
     # Choose where packaged project/workspace directories are restored.
     python codex_conversation_migrator.py import codex-conversations.zip openai --restore-workspaces-to D:\\CodexImportedProjects
 
+    # Repair local Codex sidebar/project history indexes without changing providers.
+    python codex_conversation_migrator.py repair-indexes
+
 The script uses CODEX_HOME when set; otherwise it uses ~/.codex.
-Close Codex App before export/import for the cleanest result.
+Close Codex App before export/import/migration/repair so it does not overwrite
+the repaired UI state when it exits.
 """
 
 from __future__ import annotations
@@ -52,6 +56,13 @@ BACKUP_FILES = (
     "config.toml",
 )
 WORKSPACE_MANIFEST = "workspace_manifest.json"
+LOCAL_THREAD_KEY_PREFIX = "local:"
+PROJECTLESS_THREAD_IDS_KEY = "projectless-thread-ids"
+THREAD_WORKSPACE_ROOT_HINTS_KEY = "thread-workspace-root-hints"
+THREAD_PROJECT_ASSIGNMENTS_KEY = "thread-project-assignments"
+SIDEBAR_PROJECT_THREAD_ORDERS_KEY = "sidebar-project-thread-orders"
+WORKSPACE_ROOT_OPTIONS_KEY = "electron-saved-workspace-roots"
+PROJECT_ORDER_KEY = "project-order"
 
 
 def safe_name(value: str) -> str:
@@ -591,6 +602,7 @@ def migrate_local_provider(args: argparse.Namespace) -> int:
     config_changed = False
     if not args.no_set_config:
         config_changed = set_config_provider(base, args.new_provider)
+    index_repairs = repair_project_history_indexes(base)
 
     jsonl_counts = provider_counts_from_jsonl(base)
     db_counts = provider_counts_from_state(base / "state_5.sqlite")
@@ -607,11 +619,32 @@ def migrate_local_provider(args: argparse.Namespace) -> int:
     print(f"JSONL checked: {jsonl_checked}")
     print(f"JSONL changed: {jsonl_changed}")
     print(f"JSONL skipped/unreadable: {jsonl_skipped}")
+    print(f"Project history index entries repaired: {index_repairs}")
     print(f"config.toml set to new provider: {config_changed}")
     print(f"DB provider counts: {db_counts}")
     print(f"JSONL provider counts: {jsonl_counts}")
     print()
     print("Restart Codex App after migration.")
+    return 0
+
+
+def repair_indexes_command(args: argparse.Namespace) -> int:
+    base = codex_home(args.codex_home)
+    if not base.exists():
+        print(f"Codex home does not exist: {base}", file=sys.stderr)
+        return 2
+
+    backup_dir = make_target_backup(base, "repair-indexes")
+    changed = repair_project_history_indexes(base)
+
+    print(f"Backup: {backup_dir}")
+    print(f"Backup zip: {backup_dir}.zip")
+    print()
+    print("Project history index repair complete.")
+    print(f"Codex home: {base}")
+    print(f"Global state entries repaired: {changed}")
+    print()
+    print("Restart Codex App after repair.")
     return 0
 
 
@@ -662,6 +695,216 @@ def comparable_time(value: Any) -> float:
         except ValueError:
             return 0.0
     return 0.0
+
+
+def local_thread_key(thread_id: str) -> str:
+    return f"{LOCAL_THREAD_KEY_PREFIX}{thread_id}"
+
+
+def normalize_global_path(path: Path) -> str:
+    return as_global_state_path(path)
+
+
+def comparable_path_key(value: str | Path) -> str:
+    text = str(value)
+    if text.startswith("\\\\?\\"):
+        text = text[4:]
+    return text.replace("\\", "/").rstrip("/").lower()
+
+
+def path_is_under(path: Path, root: str) -> bool:
+    path_key = comparable_path_key(path)
+    root_key = comparable_path_key(root)
+    return path_key == root_key or path_key.startswith(root_key + "/")
+
+
+def get_state_list(state: dict[str, Any], key: str) -> list[Any]:
+    value = state.setdefault(key, [])
+    if not isinstance(value, list):
+        value = []
+        state[key] = value
+    return value
+
+
+def get_state_dict(state: dict[str, Any], key: str) -> dict[str, Any]:
+    value = state.setdefault(key, {})
+    if not isinstance(value, dict):
+        value = {}
+        state[key] = value
+    return value
+
+
+def state_project_roots(state: dict[str, Any]) -> list[str]:
+    roots: list[str] = []
+    seen: set[str] = set()
+    for key in (PROJECT_ORDER_KEY, WORKSPACE_ROOT_OPTIONS_KEY):
+        value = state.get(key)
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if not isinstance(item, str) or not item:
+                continue
+            normalized = comparable_path_key(item)
+            if normalized not in seen:
+                roots.append(item)
+                seen.add(normalized)
+    return roots
+
+
+def choose_project_root(cwd: Path, roots: list[str]) -> str:
+    matches = [root for root in roots if path_is_under(cwd, root)]
+    if matches:
+        return max(matches, key=lambda item: len(comparable_path_key(item)))
+    return normalize_global_path(cwd)
+
+
+def add_unique_path(state: dict[str, Any], key: str, path_value: str) -> int:
+    values = get_state_list(state, key)
+    path_key = comparable_path_key(path_value)
+    if any(isinstance(item, str) and comparable_path_key(item) == path_key for item in values):
+        return 0
+    values.append(path_value)
+    return 1
+
+
+def collect_thread_project_records(
+    base: Path, thread_ids: set[str] | None = None
+) -> dict[str, dict[str, Any]]:
+    db = base / "state_5.sqlite"
+    if not db.exists():
+        return {}
+
+    con = connect_ro(db)
+    try:
+        if not table_exists(con, "threads"):
+            return {}
+        cols = table_columns(con, "threads")
+        wanted = ["id", "cwd", "updated_at", "updated_at_ms", "archived"]
+        select_cols = [col for col in wanted if col in cols]
+        if "id" not in select_cols or "cwd" not in select_cols:
+            return {}
+
+        records: dict[str, dict[str, Any]] = {}
+        if thread_ids:
+            ids = list(thread_ids)
+            chunks = [ids[start : start + 500] for start in range(0, len(ids), 500)]
+            where_prefix = f"where id in "
+        else:
+            chunks = [[]]
+            where_prefix = ""
+
+        quoted_cols = ",".join(f'"{col}"' for col in select_cols)
+        for chunk in chunks:
+            if chunk:
+                sql = f"select {quoted_cols} from threads {where_prefix}({','.join('?' for _ in chunk)})"
+                params: tuple[Any, ...] = tuple(chunk)
+            else:
+                sql = f"select {quoted_cols} from threads"
+                params = ()
+            for row in con.execute(sql, params):
+                data = dict(zip(select_cols, row))
+                if data.get("archived") not in (None, 0, False):
+                    continue
+                thread_id = data.get("id")
+                cwd = path_from_db(data.get("cwd"))
+                if not isinstance(thread_id, str) or cwd is None:
+                    continue
+                updated = data.get("updated_at_ms")
+                if updated is None:
+                    updated = data.get("updated_at")
+                records[thread_id] = {"cwd": cwd, "updated": comparable_time(updated)}
+        return records
+    finally:
+        con.close()
+
+
+def repair_project_history_state(
+    state: dict[str, Any],
+    thread_records: dict[str, dict[str, Any]],
+    projectless_ids: set[str] | None = None,
+) -> int:
+    if not thread_records:
+        return 0
+
+    changed = 0
+    projectless_ids = projectless_ids or set()
+
+    dst_projectless = get_state_list(state, PROJECTLESS_THREAD_IDS_KEY)
+    filtered_projectless = [
+        item
+        for item in dst_projectless
+        if not (
+            isinstance(item, str)
+            and item in thread_records
+            and item not in projectless_ids
+        )
+    ]
+    if filtered_projectless != dst_projectless:
+        state[PROJECTLESS_THREAD_IDS_KEY] = dst_projectless = filtered_projectless
+        changed += 1
+    seen_projectless = set(item for item in dst_projectless if isinstance(item, str))
+    for thread_id in sorted(projectless_ids):
+        if thread_id in thread_records and thread_id not in seen_projectless:
+            dst_projectless.append(thread_id)
+            seen_projectless.add(thread_id)
+            changed += 1
+
+    roots = state_project_roots(state)
+    assignments = get_state_dict(state, THREAD_PROJECT_ASSIGNMENTS_KEY)
+    orders = get_state_dict(state, SIDEBAR_PROJECT_THREAD_ORDERS_KEY)
+    hints = get_state_dict(state, THREAD_WORKSPACE_ROOT_HINTS_KEY)
+
+    project_threads: dict[str, list[tuple[str, float]]] = {}
+    for thread_id, record in thread_records.items():
+        cwd = record["cwd"]
+        if thread_id in projectless_ids:
+            if thread_id not in hints:
+                hints[thread_id] = normalize_global_path(cwd)
+                changed += 1
+            continue
+
+        project_root = choose_project_root(cwd, roots)
+        changed += add_unique_path(state, WORKSPACE_ROOT_OPTIONS_KEY, project_root)
+        changed += add_unique_path(state, PROJECT_ORDER_KEY, project_root)
+        roots = state_project_roots(state)
+
+        assignment = {"projectId": project_root, "projectKind": "local"}
+        if assignments.get(thread_id) != assignment:
+            assignments[thread_id] = assignment
+            changed += 1
+
+        key = local_thread_key(thread_id)
+        project_threads.setdefault(project_root, []).append((key, record["updated"]))
+
+    for project_root, keyed_threads in project_threads.items():
+        keyed_threads.sort(key=lambda item: item[1], reverse=True)
+        existing = orders.get(project_root)
+        if not isinstance(existing, list):
+            existing = []
+        existing_strings = [item for item in existing if isinstance(item, str)]
+        seen = set(existing_strings)
+        additions = [key for key, _ in keyed_threads if key not in seen]
+        if additions or existing_strings != existing:
+            orders[project_root] = existing_strings + additions
+            changed += 1
+
+    return changed
+
+
+def repair_project_history_indexes(base: Path, thread_ids: set[str] | None = None) -> int:
+    state_path = base / ".codex-global-state.json"
+    state = load_json_file(state_path)
+    records = collect_thread_project_records(base, thread_ids)
+    projectless_value = state.get(PROJECTLESS_THREAD_IDS_KEY)
+    projectless_ids = (
+        {item for item in projectless_value if isinstance(item, str)}
+        if isinstance(projectless_value, list)
+        else set()
+    )
+    changed = repair_project_history_state(state, records, projectless_ids)
+    if changed:
+        save_json_file(state_path, state)
+    return changed
 
 
 def append_or_merge_session_index(
@@ -733,17 +976,16 @@ def merge_global_state(
     dst = load_json_file(dst_path)
     changed = 0
 
-    # Ensure imported project histories can appear even when the source global
-    # state was missing or stale.
-    dst_projectless = dst.setdefault("projectless-thread-ids", [])
-    if not isinstance(dst_projectless, list):
-        dst["projectless-thread-ids"] = dst_projectless = []
-    seen_projectless = set(x for x in dst_projectless if isinstance(x, str))
-    for thread_id in sorted(imported_ids):
-        if thread_id not in seen_projectless:
-            dst_projectless.append(thread_id)
-            seen_projectless.add(thread_id)
-            changed += 1
+    src_projectless_value = src.get(PROJECTLESS_THREAD_IDS_KEY)
+    src_projectless_ids = (
+        {
+            thread_id
+            for thread_id in src_projectless_value
+            if isinstance(thread_id, str) and thread_id in imported_ids
+        }
+        if isinstance(src_projectless_value, list)
+        else set()
+    )
 
     # Pinned threads are optional UI state, so only copy them when the source
     # explicitly had them pinned.
@@ -762,7 +1004,7 @@ def merge_global_state(
                 changed += 1
 
     db_cwds = collect_thread_cwds_for_ids(base, imported_ids)
-    for key in ("thread-workspace-root-hints", "thread-projectless-output-directories"):
+    for key in (THREAD_WORKSPACE_ROOT_HINTS_KEY, "thread-projectless-output-directories"):
         src_map = src.get(key)
         if not isinstance(src_map, dict):
             src_map = {}
@@ -770,16 +1012,23 @@ def merge_global_state(
         if not isinstance(dst_map, dict):
             dst[key] = dst_map = {}
         for thread_id in imported_ids:
-            if thread_id not in src_map and key != "thread-workspace-root-hints":
+            if thread_id not in src_map and key != THREAD_WORKSPACE_ROOT_HINTS_KEY:
                 continue
             value = src_map.get(thread_id)
-            if key == "thread-workspace-root-hints" and id_to_cwd_path and thread_id in id_to_cwd_path:
+            if (
+                key == THREAD_WORKSPACE_ROOT_HINTS_KEY
+                and id_to_cwd_path
+                and thread_id in id_to_cwd_path
+            ):
                 value = as_global_state_path(id_to_cwd_path[thread_id])
-            elif key == "thread-workspace-root-hints" and thread_id in db_cwds:
+            elif key == THREAD_WORKSPACE_ROOT_HINTS_KEY and thread_id in db_cwds:
                 value = as_global_state_path(db_cwds[thread_id])
             if value is not None and dst_map.get(thread_id) != value:
                 dst_map[thread_id] = value
                 changed += 1
+
+    thread_records = collect_thread_project_records(base, imported_ids)
+    changed += repair_project_history_state(dst, thread_records, src_projectless_ids)
 
     if changed:
         save_json_file(dst_path, dst)
@@ -1222,6 +1471,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     migrate_parser.set_defaults(func=migrate_local_provider)
 
+    repair_parser = subparsers.add_parser(
+        "repair-indexes",
+        aliases=["repair"],
+        help="Repair Codex sidebar/project history indexes without changing providers.",
+    )
+    repair_parser.add_argument(
+        "--codex-home",
+        help="Target Codex home. Defaults to CODEX_HOME or ~/.codex.",
+    )
+    repair_parser.set_defaults(func=repair_indexes_command)
+
     export_parser = subparsers.add_parser(
         "export", help="Export all local Codex conversations from all providers."
     )
@@ -1289,7 +1549,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    legacy_commands = {"migrate", "export", "import", "-h", "--help"}
+    legacy_commands = {"migrate", "export", "import", "repair-indexes", "repair", "-h", "--help"}
     if len(sys.argv) >= 3 and sys.argv[1] not in legacy_commands and not sys.argv[1].startswith("-"):
         sys.argv.insert(1, "migrate")
     parser = build_parser()
