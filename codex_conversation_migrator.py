@@ -82,6 +82,10 @@ def as_db_path(path: Path) -> str:
     return resolved
 
 
+def as_global_state_path(path: Path) -> str:
+    return str(path.resolve())
+
+
 def path_from_db(value: Any) -> Path | None:
     if not isinstance(value, str) or not value:
         return None
@@ -317,6 +321,33 @@ def collect_thread_cwds(base: Path) -> dict[str, Path]:
             path = path_from_db(cwd)
             if isinstance(thread_id, str) and path is not None and path.is_dir():
                 result[thread_id] = path.resolve()
+        return result
+    finally:
+        con.close()
+
+
+def collect_thread_cwds_for_ids(base: Path, thread_ids: set[str]) -> dict[str, Path]:
+    db = base / "state_5.sqlite"
+    if not db.exists() or not thread_ids:
+        return {}
+
+    con = connect_ro(db)
+    try:
+        if not table_exists(con, "threads"):
+            return {}
+        result: dict[str, Path] = {}
+        ids = list(thread_ids)
+        for start in range(0, len(ids), 500):
+            chunk = ids[start : start + 500]
+            rows = con.execute(
+                "select id, cwd from threads where id in "
+                f"({','.join('?' for _ in chunk)})",
+                tuple(chunk),
+            )
+            for thread_id, cwd in rows:
+                path = path_from_db(cwd)
+                if isinstance(thread_id, str) and path is not None:
+                    result[thread_id] = path
         return result
     finally:
         con.close()
@@ -698,14 +729,25 @@ def merge_global_state(
         return 0
 
     src = load_json_file(package / ".codex-global-state.json")
-    if not src:
-        return 0
-
     dst_path = base / ".codex-global-state.json"
     dst = load_json_file(dst_path)
     changed = 0
 
-    for key in ("projectless-thread-ids", "pinned-thread-ids"):
+    # Ensure imported project histories can appear even when the source global
+    # state was missing or stale.
+    dst_projectless = dst.setdefault("projectless-thread-ids", [])
+    if not isinstance(dst_projectless, list):
+        dst["projectless-thread-ids"] = dst_projectless = []
+    seen_projectless = set(x for x in dst_projectless if isinstance(x, str))
+    for thread_id in sorted(imported_ids):
+        if thread_id not in seen_projectless:
+            dst_projectless.append(thread_id)
+            seen_projectless.add(thread_id)
+            changed += 1
+
+    # Pinned threads are optional UI state, so only copy them when the source
+    # explicitly had them pinned.
+    for key in ("pinned-thread-ids",):
         src_list = src.get(key)
         if not isinstance(src_list, list):
             continue
@@ -719,10 +761,11 @@ def merge_global_state(
                 seen.add(thread_id)
                 changed += 1
 
+    db_cwds = collect_thread_cwds_for_ids(base, imported_ids)
     for key in ("thread-workspace-root-hints", "thread-projectless-output-directories"):
         src_map = src.get(key)
         if not isinstance(src_map, dict):
-            continue
+            src_map = {}
         dst_map = dst.setdefault(key, {})
         if not isinstance(dst_map, dict):
             dst[key] = dst_map = {}
@@ -731,7 +774,9 @@ def merge_global_state(
                 continue
             value = src_map.get(thread_id)
             if key == "thread-workspace-root-hints" and id_to_cwd_path and thread_id in id_to_cwd_path:
-                value = as_db_path(id_to_cwd_path[thread_id])
+                value = as_global_state_path(id_to_cwd_path[thread_id])
+            elif key == "thread-workspace-root-hints" and thread_id in db_cwds:
+                value = as_global_state_path(db_cwds[thread_id])
             if value is not None and dst_map.get(thread_id) != value:
                 dst_map[thread_id] = value
                 changed += 1
@@ -1147,7 +1192,7 @@ def import_package(args: argparse.Namespace) -> int:
     print(f"Spawn edge rows imported: {edge_rows}")
     print(f"Goal rows imported: {goal_rows}")
     print(f"Session index rows appended/replaced: {index_rows}")
-    print(f"Global state entries merged: {global_changes}")
+    print(f"Global state entries merged/repaired: {global_changes}")
     print(f"config.toml set to provider: {config_changed}")
     print()
     print("Restart Codex App after import.")

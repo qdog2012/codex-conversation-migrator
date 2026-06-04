@@ -8,6 +8,7 @@ This utility works with the local Codex data directory (`CODEX_HOME` or `~/.code
 - Export complete project/workspace directories referenced by conversations by default.
 - Import conversations into another machine and rewrite them to a target provider such as `openai`.
 - Merge duplicate thread IDs safely when importing the same conversation more than once.
+- Repair project history indexes during import so projects can show their imported conversations.
 - Rewrite existing local conversations from one provider to another, such as `crs` to `openai`.
 
 > This is an unofficial local data migration helper. Close Codex App before running export, import, or migration commands.
@@ -46,6 +47,8 @@ python codex_conversation_migrator.py import codex-conversations.zip openai
 ```
 
 All imported conversations are rewritten to the target provider (`openai` in this example), so they can appear under that provider's local conversation list.
+
+During import, the tool also repairs local project history indexes by adding imported thread IDs to `projectless-thread-ids` and setting `thread-workspace-root-hints` from the imported thread `cwd`. This is done even if the source machine's `.codex-global-state.json` was missing those mappings.
 
 If the package includes project/workspace directories, they are restored by default under:
 
