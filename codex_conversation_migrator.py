@@ -42,6 +42,7 @@ import sys
 import tempfile
 import zipfile
 import hashlib
+from xml.sax.saxutils import escape as xml_escape
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -625,6 +626,140 @@ def repair_thread_sources(
         con.close()
 
 
+def patch_environment_context_text(text: str, cwd: str) -> tuple[str, bool]:
+    if "<environment_context>" not in text or "</environment_context>" not in text:
+        return text, False
+    if "<workspace_roots>" in text or "<filesystem>" in text:
+        return text, False
+
+    escaped_cwd = xml_escape(cwd)
+    filesystem = (
+        f'  <filesystem><workspace_roots><root>{escaped_cwd}</root></workspace_roots>'
+        '<permission_profile type="disabled"><file_system type="unrestricted" />'
+        "</permission_profile></filesystem>\n"
+    )
+    return text.replace("</environment_context>", filesystem + "</environment_context>", 1), True
+
+
+def repair_session_workspace_roots(path: Path, cwd: Path) -> int:
+    if not path.exists():
+        return 0
+
+    cwd_text = as_global_state_path(cwd)
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return 0
+
+    changed = 0
+    output: list[str] = []
+    for line in lines:
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            output.append(line)
+            continue
+
+        line_changed = False
+        if obj.get("type") == "turn_context":
+            payload = obj.get("payload")
+            if isinstance(payload, dict):
+                roots = payload.get("workspace_roots")
+                if not (isinstance(roots, list) and any(isinstance(item, str) for item in roots)):
+                    payload["workspace_roots"] = [cwd_text]
+                    line_changed = True
+
+        if obj.get("type") == "response_item":
+            payload = obj.get("payload")
+            content = payload.get("content") if isinstance(payload, dict) else None
+            if isinstance(content, list):
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+                    text = item.get("text")
+                    if not isinstance(text, str):
+                        continue
+                    patched, patched_changed = patch_environment_context_text(text, cwd_text)
+                    if patched_changed:
+                        item["text"] = patched
+                        line_changed = True
+
+        if line_changed:
+            changed += 1
+            output.append(json.dumps(obj, ensure_ascii=False, separators=(",", ":")))
+        else:
+            output.append(line)
+
+    if changed:
+        stat = path.stat()
+        path.write_text("\n".join(output) + "\n", encoding="utf-8", newline="")
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    return changed
+
+
+def repair_project_workspace_roots(
+    base: Path, thread_ids: set[str] | None = None
+) -> tuple[int, int]:
+    state_path = base / ".codex-global-state.json"
+    state = load_json_file(state_path)
+    projectless_value = state.get(PROJECTLESS_THREAD_IDS_KEY)
+    projectless_ids = (
+        {item for item in projectless_value if isinstance(item, str)}
+        if isinstance(projectless_value, list)
+        else set()
+    )
+
+    state_db = base / "state_5.sqlite"
+    if not state_db.exists():
+        return (0, 0)
+
+    con = sqlite3.connect(state_db)
+    con.row_factory = sqlite3.Row
+    try:
+        if not table_exists(con, "threads"):
+            return (0, 0)
+        cols = table_columns(con, "threads")
+        if not {"id", "cwd", "rollout_path"}.issubset(cols):
+            return (0, 0)
+
+        if thread_ids:
+            ids = list(thread_ids)
+            chunks = [ids[start : start + 500] for start in range(0, len(ids), 500)]
+        else:
+            chunks = [[]]
+
+        files_changed = 0
+        lines_changed = 0
+        for chunk in chunks:
+            if chunk:
+                sql = (
+                    "select id, cwd, rollout_path, archived from threads where id in "
+                    f"({','.join('?' for _ in chunk)})"
+                )
+                params: tuple[Any, ...] = tuple(chunk)
+            else:
+                sql = "select id, cwd, rollout_path, archived from threads"
+                params = ()
+
+            for row in con.execute(sql, params):
+                thread_id = row["id"]
+                if not isinstance(thread_id, str) or thread_id in projectless_ids:
+                    continue
+                if row["archived"] not in (None, 0, False):
+                    continue
+                cwd = path_from_db(row["cwd"])
+                rollout_path = path_from_db(row["rollout_path"])
+                if cwd is None or rollout_path is None:
+                    continue
+                changed = repair_session_workspace_roots(rollout_path, cwd)
+                if changed:
+                    files_changed += 1
+                    lines_changed += changed
+        return (files_changed, lines_changed)
+    finally:
+        con.close()
+
+
 def migrate_local_provider(args: argparse.Namespace) -> int:
     if args.old_provider == args.new_provider:
         print("old_provider and new_provider are the same; nothing to do.", file=sys.stderr)
@@ -650,6 +785,7 @@ def migrate_local_provider(args: argparse.Namespace) -> int:
         config_changed = set_config_provider(base, args.new_provider)
     index_repairs = repair_project_history_indexes(base)
     thread_source_repairs = repair_thread_sources(base)
+    workspace_files_repaired, workspace_lines_repaired = repair_project_workspace_roots(base)
 
     jsonl_counts = provider_counts_from_jsonl(base)
     db_counts = provider_counts_from_state(base / "state_5.sqlite")
@@ -668,6 +804,8 @@ def migrate_local_provider(args: argparse.Namespace) -> int:
     print(f"JSONL skipped/unreadable: {jsonl_skipped}")
     print(f"Project history index entries repaired: {index_repairs}")
     print(f"Thread source rows repaired: {thread_source_repairs}")
+    print(f"Project workspace root files repaired: {workspace_files_repaired}")
+    print(f"Project workspace root JSONL lines repaired: {workspace_lines_repaired}")
     print(f"config.toml set to new provider: {config_changed}")
     print(f"DB provider counts: {db_counts}")
     print(f"JSONL provider counts: {jsonl_counts}")
@@ -685,6 +823,7 @@ def repair_indexes_command(args: argparse.Namespace) -> int:
     backup_dir = make_target_backup(base, "repair-indexes")
     changed = repair_project_history_indexes(base)
     thread_source_repairs = repair_thread_sources(base)
+    workspace_files_repaired, workspace_lines_repaired = repair_project_workspace_roots(base)
 
     print(f"Backup: {backup_dir}")
     print(f"Backup zip: {backup_dir}.zip")
@@ -693,6 +832,8 @@ def repair_indexes_command(args: argparse.Namespace) -> int:
     print(f"Codex home: {base}")
     print(f"Global state entries repaired: {changed}")
     print(f"Thread source rows repaired: {thread_source_repairs}")
+    print(f"Project workspace root files repaired: {workspace_files_repaired}")
+    print(f"Project workspace root JSONL lines repaired: {workspace_lines_repaired}")
     print()
     print("Restart Codex App after repair.")
     return 0
@@ -1478,6 +1619,9 @@ def import_package(args: argparse.Namespace) -> int:
             base, package, imported_ids, id_to_cwd_path
         )
         thread_source_repairs = repair_thread_sources(base, imported_ids)
+        workspace_files_repaired, workspace_lines_repaired = repair_project_workspace_roots(
+            base, imported_ids
+        )
 
     config_changed = False
     if not args.no_set_config:
@@ -1507,6 +1651,8 @@ def import_package(args: argparse.Namespace) -> int:
     print(f"Session index rows appended/replaced: {index_rows}")
     print(f"Global state entries merged/repaired: {global_changes}")
     print(f"Thread source rows repaired: {thread_source_repairs}")
+    print(f"Project workspace root files repaired: {workspace_files_repaired}")
+    print(f"Project workspace root JSONL lines repaired: {workspace_lines_repaired}")
     print(f"config.toml set to provider: {config_changed}")
     print()
     print("Restart Codex App after import.")
