@@ -8,8 +8,8 @@ This utility works with the local Codex data directory (`CODEX_HOME` or `~/.code
 - Export complete project/workspace directories referenced by conversations by default.
 - Import conversations into another machine and rewrite them to a target provider such as `openai`.
 - Merge duplicate thread IDs safely when importing the same conversation more than once.
-- Repair project history indexes, legacy thread source metadata, and missing project workspace roots during import or local migration so projects can show and open their conversations.
-- Repair project history indexes, legacy thread source metadata, and missing project workspace roots directly without changing providers.
+- Repair project history indexes, legacy thread source metadata in both SQLite and session files, and missing project workspace roots during import or local migration so projects can show and open their conversations.
+- Repair project history indexes, legacy thread source metadata in both SQLite and session files, and missing project workspace roots directly without changing providers.
 - Rewrite existing local conversations from one provider to another, such as `crs` to `openai`.
 
 > This is an unofficial local data migration helper. Close Codex App before running export, import, migration, or repair commands. Codex keeps some sidebar state in memory while it is running, and may overwrite external repairs when it exits.
@@ -49,7 +49,7 @@ python codex_conversation_migrator.py import codex-conversations.zip openai
 
 All imported conversations are rewritten to the target provider (`openai` in this example), so they can appear under that provider's local conversation list.
 
-During import, the tool also repairs local project history indexes and legacy thread metadata. It preserves source `projectless-thread-ids` only for threads that were actually projectless, writes `thread-project-assignments` for project threads, updates `sidebar-project-thread-orders` with `local:<thread_id>` keys, backfills `thread-projectless-output-directories` for older projectless threads, fills missing `thread_source` values with `user`, and patches older project session files that are missing `workspace_roots`.
+During import, the tool also repairs local project history indexes and legacy thread metadata. It preserves source `projectless-thread-ids` only for threads that were actually projectless, writes `thread-project-assignments` for project threads, updates `sidebar-project-thread-orders` with `local:<thread_id>` keys, backfills `thread-projectless-output-directories` for older projectless threads, fills missing `thread_source` values with `user` in SQLite and session metadata, and patches older project session files that are missing `workspace_roots`.
 
 If the package includes project/workspace directories, they are restored by default under:
 
@@ -101,7 +101,7 @@ python codex_conversation_migrator.py crs openai
 
 This rewrites local conversation metadata from the old provider to the new provider and updates `config.toml` unless `--no-set-config` is provided.
 
-It also repairs project history indexes, fills missing `thread_source` values, and patches older project session files that are missing `workspace_roots` after the provider rewrite.
+It also repairs project history indexes, fills missing `thread_source` values in SQLite and session metadata, and patches older project session files that are missing `workspace_roots` after the provider rewrite.
 
 ### Repair project history indexes only
 
@@ -117,7 +117,7 @@ Short alias:
 python codex_conversation_migrator.py repair
 ```
 
-This rebuilds project assignment state and projectless output-directory hints from `state_5.sqlite` and `.codex-global-state.json`, fills missing `thread_source` values with `user`, and patches older project session files that are missing `workspace_roots`, without changing providers.
+This rebuilds project assignment state and projectless output-directory hints from `state_5.sqlite` and `.codex-global-state.json`, fills missing `thread_source` values with `user` in SQLite and session metadata, and patches older project session files that are missing `workspace_roots`, without changing providers.
 
 ## Custom Codex Home
 

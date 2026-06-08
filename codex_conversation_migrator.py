@@ -626,6 +626,82 @@ def repair_thread_sources(
         con.close()
 
 
+def db_thread_sources(base: Path, thread_ids: set[str] | None = None) -> dict[str, str]:
+    state_db = base / "state_5.sqlite"
+    if not state_db.exists():
+        return {}
+
+    con = connect_ro(state_db)
+    try:
+        if not table_exists(con, "threads"):
+            return {}
+        cols = table_columns(con, "threads")
+        if "id" not in cols or "thread_source" not in cols:
+            return {}
+
+        result: dict[str, str] = {}
+        if thread_ids:
+            ids = list(thread_ids)
+            for start in range(0, len(ids), 500):
+                chunk = ids[start : start + 500]
+                rows = con.execute(
+                    "select id, thread_source from threads where id in "
+                    f"({','.join('?' for _ in chunk)})",
+                    tuple(chunk),
+                )
+                for thread_id, source in rows:
+                    if isinstance(thread_id, str) and isinstance(source, str) and source:
+                        result[thread_id] = source
+            return result
+
+        for thread_id, source in con.execute("select id, thread_source from threads"):
+            if isinstance(thread_id, str) and isinstance(source, str) and source:
+                result[thread_id] = source
+        return result
+    finally:
+        con.close()
+
+
+def repair_session_meta_thread_sources(
+    base: Path, thread_ids: set[str] | None = None, default_source: str = "user"
+) -> int:
+    sessions = collect_session_files(base)
+    if thread_ids is not None:
+        sessions = {
+            thread_id: item
+            for thread_id, item in sessions.items()
+            if thread_id in thread_ids
+        }
+    if not sessions:
+        return 0
+
+    sources = db_thread_sources(base, set(sessions))
+    changed = 0
+    for thread_id, (_, path) in sessions.items():
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                first_line = handle.readline()
+                rest = handle.read()
+            obj = json.loads(first_line)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+
+        payload = obj.get("payload")
+        if obj.get("type") != "session_meta" or not isinstance(payload, dict):
+            continue
+        if payload.get("thread_source"):
+            continue
+
+        payload["thread_source"] = sources.get(thread_id, default_source)
+        stat = path.stat()
+        with path.open("w", encoding="utf-8", newline="") as handle:
+            handle.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
+            handle.write(rest)
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        changed += 1
+    return changed
+
+
 def patch_environment_context_text(text: str, cwd: str) -> tuple[str, bool]:
     if "<environment_context>" not in text or "</environment_context>" not in text:
         return text, False
@@ -785,6 +861,7 @@ def migrate_local_provider(args: argparse.Namespace) -> int:
         config_changed = set_config_provider(base, args.new_provider)
     index_repairs = repair_project_history_indexes(base)
     thread_source_repairs = repair_thread_sources(base)
+    session_meta_source_repairs = repair_session_meta_thread_sources(base)
     workspace_files_repaired, workspace_lines_repaired = repair_project_workspace_roots(base)
 
     jsonl_counts = provider_counts_from_jsonl(base)
@@ -804,6 +881,7 @@ def migrate_local_provider(args: argparse.Namespace) -> int:
     print(f"JSONL skipped/unreadable: {jsonl_skipped}")
     print(f"Project history index entries repaired: {index_repairs}")
     print(f"Thread source rows repaired: {thread_source_repairs}")
+    print(f"Session meta thread source files repaired: {session_meta_source_repairs}")
     print(f"Project workspace root files repaired: {workspace_files_repaired}")
     print(f"Project workspace root JSONL lines repaired: {workspace_lines_repaired}")
     print(f"config.toml set to new provider: {config_changed}")
@@ -823,6 +901,7 @@ def repair_indexes_command(args: argparse.Namespace) -> int:
     backup_dir = make_target_backup(base, "repair-indexes")
     changed = repair_project_history_indexes(base)
     thread_source_repairs = repair_thread_sources(base)
+    session_meta_source_repairs = repair_session_meta_thread_sources(base)
     workspace_files_repaired, workspace_lines_repaired = repair_project_workspace_roots(base)
 
     print(f"Backup: {backup_dir}")
@@ -832,6 +911,7 @@ def repair_indexes_command(args: argparse.Namespace) -> int:
     print(f"Codex home: {base}")
     print(f"Global state entries repaired: {changed}")
     print(f"Thread source rows repaired: {thread_source_repairs}")
+    print(f"Session meta thread source files repaired: {session_meta_source_repairs}")
     print(f"Project workspace root files repaired: {workspace_files_repaired}")
     print(f"Project workspace root JSONL lines repaired: {workspace_lines_repaired}")
     print()
@@ -1619,6 +1699,9 @@ def import_package(args: argparse.Namespace) -> int:
             base, package, imported_ids, id_to_cwd_path
         )
         thread_source_repairs = repair_thread_sources(base, imported_ids)
+        session_meta_source_repairs = repair_session_meta_thread_sources(
+            base, imported_ids
+        )
         workspace_files_repaired, workspace_lines_repaired = repair_project_workspace_roots(
             base, imported_ids
         )
@@ -1651,6 +1734,7 @@ def import_package(args: argparse.Namespace) -> int:
     print(f"Session index rows appended/replaced: {index_rows}")
     print(f"Global state entries merged/repaired: {global_changes}")
     print(f"Thread source rows repaired: {thread_source_repairs}")
+    print(f"Session meta thread source files repaired: {session_meta_source_repairs}")
     print(f"Project workspace root files repaired: {workspace_files_repaired}")
     print(f"Project workspace root JSONL lines repaired: {workspace_lines_repaired}")
     print(f"config.toml set to provider: {config_changed}")
