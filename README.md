@@ -49,7 +49,7 @@ python codex_conversation_migrator.py import codex-conversations.zip openai
 
 All imported conversations are rewritten to the target provider (`openai` in this example), so they can appear under that provider's local conversation list.
 
-During import, the tool also repairs local project history indexes. It preserves source `projectless-thread-ids` only for threads that were actually projectless, writes `thread-project-assignments` for project threads, and updates `sidebar-project-thread-orders` with `local:<thread_id>` keys so older project conversations can appear under their project instead of only in the recent global window.
+During import, the tool also repairs local project history indexes. It preserves source `projectless-thread-ids` only for threads that were actually projectless, writes `thread-project-assignments` for project threads, updates `sidebar-project-thread-orders` with `local:<thread_id>` keys, and backfills `thread-projectless-output-directories` for older projectless threads.
 
 If the package includes project/workspace directories, they are restored by default under:
 
@@ -105,7 +105,7 @@ It also repairs project history indexes after the provider rewrite.
 
 ### Repair project history indexes only
 
-If provider values are already correct but some project folders show `No conversations` / `暂无对话` even though the threads exist in local history, close Codex App and run:
+If provider values are already correct but some project folders show `No conversations` / `暂无对话`, or an older projectless search result appears but will not open even though the thread exists in local history, close Codex App and run:
 
 ```powershell
 python codex_conversation_migrator.py repair-indexes
@@ -117,7 +117,7 @@ Short alias:
 python codex_conversation_migrator.py repair
 ```
 
-This rebuilds project assignment state from `state_5.sqlite` and `.codex-global-state.json` without changing providers or session files.
+This rebuilds project assignment state and projectless output-directory hints from `state_5.sqlite` and `.codex-global-state.json` without changing providers or session files.
 
 ## Custom Codex Home
 

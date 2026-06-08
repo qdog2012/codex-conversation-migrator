@@ -59,6 +59,7 @@ WORKSPACE_MANIFEST = "workspace_manifest.json"
 LOCAL_THREAD_KEY_PREFIX = "local:"
 PROJECTLESS_THREAD_IDS_KEY = "projectless-thread-ids"
 THREAD_WORKSPACE_ROOT_HINTS_KEY = "thread-workspace-root-hints"
+THREAD_PROJECTLESS_OUTPUT_DIRECTORIES_KEY = "thread-projectless-output-directories"
 THREAD_PROJECT_ASSIGNMENTS_KEY = "thread-project-assignments"
 SIDEBAR_PROJECT_THREAD_ORDERS_KEY = "sidebar-project-thread-orders"
 WORKSPACE_ROOT_OPTIONS_KEY = "electron-saved-workspace-roots"
@@ -758,6 +759,10 @@ def choose_project_root(cwd: Path, roots: list[str]) -> str:
     return normalize_global_path(cwd)
 
 
+def default_projectless_output_dir(cwd: Path) -> Path:
+    return cwd / "outputs"
+
+
 def add_unique_path(state: dict[str, Any], key: str, path_value: str) -> int:
     values = get_state_list(state, key)
     path_key = comparable_path_key(path_value)
@@ -853,6 +858,7 @@ def repair_project_history_state(
     assignments = get_state_dict(state, THREAD_PROJECT_ASSIGNMENTS_KEY)
     orders = get_state_dict(state, SIDEBAR_PROJECT_THREAD_ORDERS_KEY)
     hints = get_state_dict(state, THREAD_WORKSPACE_ROOT_HINTS_KEY)
+    output_dirs = get_state_dict(state, THREAD_PROJECTLESS_OUTPUT_DIRECTORIES_KEY)
 
     project_threads: dict[str, list[tuple[str, float]]] = {}
     for thread_id, record in thread_records.items():
@@ -860,6 +866,11 @@ def repair_project_history_state(
         if thread_id in projectless_ids:
             if thread_id not in hints:
                 hints[thread_id] = normalize_global_path(cwd)
+                changed += 1
+            if thread_id not in output_dirs:
+                output_dirs[thread_id] = normalize_global_path(
+                    default_projectless_output_dir(cwd)
+                )
                 changed += 1
             continue
 
@@ -1004,7 +1015,10 @@ def merge_global_state(
                 changed += 1
 
     db_cwds = collect_thread_cwds_for_ids(base, imported_ids)
-    for key in (THREAD_WORKSPACE_ROOT_HINTS_KEY, "thread-projectless-output-directories"):
+    for key in (
+        THREAD_WORKSPACE_ROOT_HINTS_KEY,
+        THREAD_PROJECTLESS_OUTPUT_DIRECTORIES_KEY,
+    ):
         src_map = src.get(key)
         if not isinstance(src_map, dict):
             src_map = {}
