@@ -15,6 +15,8 @@ This utility works with the local Codex data directory (`CODEX_HOME` or `~/.code
 
 > This is an unofficial local data migration helper. Close Codex App before running export, import, migration, repair, or pin commands. Codex keeps some sidebar state in memory while it is running, and may overwrite external repairs when it exits.
 
+Mutating commands (`migrate`, `import`, `repair-indexes`, and `pin`) refuse to run while a `Codex.exe` process is detected. Close Codex App completely first. Use `--force-while-running` only when you intentionally accept that Codex may overwrite external state changes.
+
 ## Requirements
 
 - Python 3.10+
@@ -133,6 +135,8 @@ Then pin the thread ID:
 ```powershell
 python codex_conversation_migrator.py pin 019dd2bd-f4a0-7121-8fbc-aa2129dabc4f
 ```
+
+Close Codex App completely before running `pin`; otherwise Codex may overwrite `.codex-global-state.json` when it exits or restarts, making the command appear successful but not persist.
 
 The `pin` command also accepts a rollout JSONL path and extracts the thread ID from the filename:
 

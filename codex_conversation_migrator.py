@@ -41,6 +41,7 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import zipfile
@@ -81,6 +82,70 @@ def safe_name(value: str) -> str:
 def extract_thread_id(value: str) -> str | None:
     match = THREAD_ID_PATTERN.search(value)
     return match.group(0).lower() if match else None
+
+
+def running_codex_processes() -> list[str]:
+    if os.environ.get("CODEX_MIGRATOR_SKIP_PROCESS_CHECK"):
+        return []
+
+    try:
+        if os.name == "nt":
+            result = subprocess.run(
+                ["tasklist", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                return []
+            names: list[str] = []
+            for raw_line in result.stdout.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                first = line.split(",", 1)[0].strip().strip('"')
+                if first.lower() == "codex.exe":
+                    names.append(first)
+            return sorted(set(names), key=str.lower)
+
+        result = subprocess.run(
+            ["ps", "-A", "-o", "comm="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            return []
+        return sorted(
+            {line.strip() for line in result.stdout.splitlines() if line.strip().lower() == "codex"},
+            key=str.lower,
+        )
+    except OSError:
+        return []
+
+
+def ensure_codex_not_running(args: argparse.Namespace, action: str) -> bool:
+    if getattr(args, "force_while_running", False):
+        return True
+
+    processes = running_codex_processes()
+    if not processes:
+        return True
+
+    names = ", ".join(processes)
+    print(
+        f"Codex App appears to be running ({names}). Close Codex App completely before {action}.",
+        file=sys.stderr,
+    )
+    print(
+        "Otherwise Codex may overwrite this script's changes when it exits or restarts.",
+        file=sys.stderr,
+    )
+    print(
+        "Use --force-while-running only if you understand that risk.",
+        file=sys.stderr,
+    )
+    return False
 
 
 def now_stamp() -> str:
@@ -857,6 +922,8 @@ def migrate_local_provider(args: argparse.Namespace) -> int:
     if not base.exists():
         print(f"Codex home does not exist: {base}", file=sys.stderr)
         return 2
+    if not ensure_codex_not_running(args, "migrating conversations"):
+        return 2
 
     backup_dir = make_target_backup(
         base,
@@ -908,6 +975,8 @@ def repair_indexes_command(args: argparse.Namespace) -> int:
     base = codex_home(args.codex_home)
     if not base.exists():
         print(f"Codex home does not exist: {base}", file=sys.stderr)
+        return 2
+    if not ensure_codex_not_running(args, "repairing indexes"):
         return 2
 
     backup_dir = make_target_backup(base, "repair-indexes")
@@ -1004,6 +1073,8 @@ def pin_threads_command(args: argparse.Namespace) -> int:
     base = codex_home(args.codex_home)
     if not base.exists():
         print(f"Codex home does not exist: {base}", file=sys.stderr)
+        return 2
+    if not ensure_codex_not_running(args, "changing pinned threads"):
         return 2
 
     thread_ids: list[str] = []
@@ -1715,6 +1786,8 @@ def import_package(args: argparse.Namespace) -> int:
     if not base.exists():
         print(f"Codex home does not exist: {base}", file=sys.stderr)
         return 2
+    if not ensure_codex_not_running(args, "importing conversations"):
+        return 2
 
     target_db = base / "state_5.sqlite"
     if not target_db.exists():
@@ -1920,6 +1993,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not change config.toml model_provider.",
     )
+    migrate_parser.add_argument(
+        "--force-while-running",
+        action="store_true",
+        help="Allow migration while Codex App appears to be running.",
+    )
     migrate_parser.set_defaults(func=migrate_local_provider)
 
     repair_parser = subparsers.add_parser(
@@ -1930,6 +2008,11 @@ def build_parser() -> argparse.ArgumentParser:
     repair_parser.add_argument(
         "--codex-home",
         help="Target Codex home. Defaults to CODEX_HOME or ~/.codex.",
+    )
+    repair_parser.add_argument(
+        "--force-while-running",
+        action="store_true",
+        help="Allow repair while Codex App appears to be running.",
     )
     repair_parser.set_defaults(func=repair_indexes_command)
 
@@ -1973,6 +2056,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--unpin",
         action="store_true",
         help="Remove the thread ids from pinned threads instead of adding them.",
+    )
+    pin_parser.add_argument(
+        "--force-while-running",
+        action="store_true",
+        help="Allow pin changes while Codex App appears to be running.",
     )
     pin_parser.set_defaults(func=pin_threads_command)
 
@@ -2036,6 +2124,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-set-config",
         action="store_true",
         help="Do not change target config.toml model_provider.",
+    )
+    import_parser.add_argument(
+        "--force-while-running",
+        action="store_true",
+        help="Allow import while Codex App appears to be running.",
     )
     import_parser.set_defaults(func=import_package)
 
