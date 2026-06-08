@@ -27,9 +27,11 @@ Examples:
     # Find and pin a readable thread that still does not appear in normal lists.
     python codex_conversation_migrator.py search IndustryResearch
     python codex_conversation_migrator.py pin 019dd2bd-f4a0-7121-8fbc-aa2129dabc4f
+    # If pinning is not enough, create a new visible copy of the thread.
+    python codex_conversation_migrator.py rescue-visible 019dd2bd-f4a0-7121-8fbc-aa2129dabc4f
 
 The script uses CODEX_HOME when set; otherwise it uses ~/.codex.
-Close Codex App before export/import/migration/repair/pin so it does not
+Close Codex App before export/import/migration/repair/pin/rescue so it does not
 overwrite the repaired UI state when it exits.
 """
 
@@ -42,6 +44,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import secrets
 import sys
 import tempfile
 import zipfile
@@ -82,6 +85,20 @@ def safe_name(value: str) -> str:
 def extract_thread_id(value: str) -> str | None:
     match = THREAD_ID_PATTERN.search(value)
     return match.group(0).lower() if match else None
+
+
+def uuid7_now() -> str:
+    """Generate a UUIDv7-shaped id compatible with native Codex thread ids."""
+    timestamp_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    rand_a = secrets.randbits(12)
+    rand_b = secrets.randbits(62)
+    value = (timestamp_ms & ((1 << 48) - 1)) << 80
+    value |= 0x7 << 76
+    value |= rand_a << 64
+    value |= 0b10 << 62
+    value |= rand_b
+    text = f"{value:032x}"
+    return f"{text[:8]}-{text[8:12]}-{text[12:16]}-{text[16:20]}-{text[20:]}"
 
 
 def running_codex_processes() -> list[str]:
@@ -1146,6 +1163,204 @@ def pin_threads_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def copy_session_as_thread(
+    source: Path,
+    target: Path,
+    new_thread_id: str,
+    cwd: Path,
+    provider: str,
+    source_name: str,
+    thread_source: str,
+    timestamp: datetime,
+) -> bool:
+    try:
+        with source.open("r", encoding="utf-8") as src, target.open(
+            "w", encoding="utf-8", newline=""
+        ) as dst:
+            first_line = src.readline()
+            first = json.loads(first_line)
+            if first.get("type") != "session_meta" or not isinstance(
+                first.get("payload"), dict
+            ):
+                return False
+            iso = timestamp.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            payload = first["payload"]
+            first["timestamp"] = iso
+            payload["id"] = new_thread_id
+            payload["timestamp"] = iso
+            payload["cwd"] = as_global_state_path(cwd)
+            payload["model_provider"] = provider
+            payload["source"] = source_name
+            payload["thread_source"] = thread_source
+            dst.write(json.dumps(first, ensure_ascii=False, separators=(",", ":")) + "\n")
+            shutil.copyfileobj(src, dst)
+        return True
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+
+
+def rescue_visible_thread_command(args: argparse.Namespace) -> int:
+    base = codex_home(args.codex_home)
+    if not base.exists():
+        print(f"Codex home does not exist: {base}", file=sys.stderr)
+        return 2
+    if not ensure_codex_not_running(args, "creating a visible thread copy"):
+        return 2
+
+    old_thread_id = extract_thread_id(args.thread_id)
+    if old_thread_id is None:
+        print(f"Could not parse thread id from: {args.thread_id}", file=sys.stderr)
+        return 2
+
+    db_path = base / "state_5.sqlite"
+    if not db_path.exists():
+        print(f"Codex state database does not exist: {db_path}", file=sys.stderr)
+        return 2
+
+    backup_dir = make_target_backup(base, "rescue-visible-thread")
+    now = datetime.now(timezone.utc)
+    now_s = int(now.timestamp())
+    now_ms = int(now.timestamp() * 1000)
+    new_thread_id = args.new_thread_id or uuid7_now()
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        if conn.execute("select 1 from threads where id=?", (new_thread_id,)).fetchone():
+            print(f"New thread id already exists: {new_thread_id}", file=sys.stderr)
+            return 2
+
+        old = conn.execute("select * from threads where id=?", (old_thread_id,)).fetchone()
+        if not old:
+            print(f"Thread not found: {old_thread_id}", file=sys.stderr)
+            return 2
+
+        old_path = path_from_db(old["rollout_path"])
+        if old_path is None or not old_path.exists():
+            print(f"Session file not found: {old['rollout_path']}", file=sys.stderr)
+            return 2
+
+        old_cwd = path_from_db(old["cwd"])
+        cwd = Path(args.project_root).expanduser().resolve() if args.project_root else old_cwd
+        if cwd is None:
+            print("Could not determine project root for rescued thread.", file=sys.stderr)
+            return 2
+
+        session_dir = base / "sessions" / now.strftime("%Y") / now.strftime("%m") / now.strftime("%d")
+        session_dir.mkdir(parents=True, exist_ok=True)
+        new_path = session_dir / (
+            f"rollout-{now.strftime('%Y-%m-%dT%H-%M-%S')}-{new_thread_id}.jsonl"
+        )
+
+        provider = args.provider or old["model_provider"] or "openai"
+        source_name = old["source"] or "vscode"
+        thread_source = old["thread_source"] or "user"
+        if not copy_session_as_thread(
+            old_path,
+            new_path,
+            new_thread_id,
+            cwd,
+            provider,
+            source_name,
+            thread_source,
+            now,
+        ):
+            print(f"Could not copy session file: {old_path}", file=sys.stderr)
+            return 2
+
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(threads)")]
+        new_row = dict(old)
+        new_row["id"] = new_thread_id
+        new_row["rollout_path"] = as_db_path(new_path)
+        new_row["cwd"] = as_db_path(cwd)
+        new_row["model_provider"] = provider
+        new_row["source"] = source_name
+        new_row["thread_source"] = thread_source
+        new_row["archived"] = 0
+        if "created_at" in new_row:
+            new_row["created_at"] = now_s
+        if "created_at_ms" in new_row:
+            new_row["created_at_ms"] = now_ms
+        if "updated_at" in new_row:
+            new_row["updated_at"] = now_s
+        if "updated_at_ms" in new_row:
+            new_row["updated_at_ms"] = now_ms
+
+        conn.execute(
+            f"INSERT INTO threads ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+            [new_row.get(column) for column in columns],
+        )
+
+        for table in ("thread_dynamic_tools", "thread_spawn_edges"):
+            if not table_exists(conn, table):
+                continue
+            table_cols = table_columns(conn, table)
+            if "thread_id" not in table_cols:
+                continue
+            for row in conn.execute(
+                f"SELECT * FROM {table} WHERE thread_id=?", (old_thread_id,)
+            ).fetchall():
+                copied = dict(row)
+                copied["thread_id"] = new_thread_id
+                conn.execute(
+                    f"INSERT OR IGNORE INTO {table} ({','.join(table_cols)}) "
+                    f"VALUES ({','.join('?' for _ in table_cols)})",
+                    [copied.get(column) for column in table_cols],
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+    state_path = base / ".codex-global-state.json"
+    state = load_json_file(state_path)
+    project_root = normalize_global_path(cwd)
+    changed = 0
+    changed += add_unique_path(state, WORKSPACE_ROOT_OPTIONS_KEY, project_root)
+    changed += add_unique_path(state, PROJECT_ORDER_KEY, project_root)
+
+    assignments = get_state_dict(state, THREAD_PROJECT_ASSIGNMENTS_KEY)
+    assignment = {"projectId": project_root, "projectKind": "local"}
+    if assignments.get(new_thread_id) != assignment:
+        assignments[new_thread_id] = assignment
+        changed += 1
+
+    orders = get_state_dict(state, SIDEBAR_PROJECT_THREAD_ORDERS_KEY)
+    thread_key = local_thread_key(new_thread_id)
+    existing = orders.get(project_root)
+    existing_strings = [item for item in existing if isinstance(item, str)] if isinstance(existing, list) else []
+    new_order = [thread_key] + [item for item in existing_strings if item != thread_key]
+    if new_order != existing:
+        orders[project_root] = new_order
+        changed += 1
+
+    projectless = get_state_list(state, PROJECTLESS_THREAD_IDS_KEY)
+    filtered_projectless = [item for item in projectless if item != new_thread_id]
+    if filtered_projectless != projectless:
+        state[PROJECTLESS_THREAD_IDS_KEY] = filtered_projectless
+        changed += 1
+
+    if not args.no_pin:
+        pinned = get_state_list(state, PINNED_THREAD_IDS_KEY)
+        if new_thread_id not in pinned:
+            pinned.append(new_thread_id)
+            changed += 1
+
+    if changed:
+        save_json_file(state_path, state)
+
+    print(f"Backup: {backup_dir}")
+    print(f"Backup zip: {backup_dir}.zip")
+    print()
+    print("Visible thread copy created.")
+    print(f"Original thread id: {old_thread_id}")
+    print(f"New thread id: {new_thread_id}")
+    print(f"Project root: {project_root}")
+    print(f"Session file: {new_path}")
+    print()
+    print("Restart Codex App after rescue.")
+    return 0
+
+
 def extract_package(zip_path: Path, dst: Path) -> Path:
     if not zip_path.exists():
         raise FileNotFoundError(f"Package not found: {zip_path}")
@@ -2064,6 +2279,43 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pin_parser.set_defaults(func=pin_threads_command)
 
+    rescue_parser = subparsers.add_parser(
+        "rescue-visible",
+        aliases=["clone-visible"],
+        help=(
+            "Create a new visible copy of a readable thread that no longer "
+            "appears in normal project/sidebar lists."
+        ),
+    )
+    rescue_parser.add_argument("thread_id", help="Thread id or rollout JSONL path to copy.")
+    rescue_parser.add_argument(
+        "--codex-home",
+        help="Target Codex home. Defaults to CODEX_HOME or ~/.codex.",
+    )
+    rescue_parser.add_argument(
+        "--project-root",
+        help="Project root for the visible copy. Defaults to the source thread cwd.",
+    )
+    rescue_parser.add_argument(
+        "--provider",
+        help="Provider value for the visible copy. Defaults to the source thread provider.",
+    )
+    rescue_parser.add_argument(
+        "--new-thread-id",
+        help="Explicit new thread id. Defaults to a generated UUIDv7-style id.",
+    )
+    rescue_parser.add_argument(
+        "--no-pin",
+        action="store_true",
+        help="Do not pin the visible copy.",
+    )
+    rescue_parser.add_argument(
+        "--force-while-running",
+        action="store_true",
+        help="Allow rescue while Codex App appears to be running.",
+    )
+    rescue_parser.set_defaults(func=rescue_visible_thread_command)
+
     export_parser = subparsers.add_parser(
         "export", help="Export all local Codex conversations from all providers."
     )
@@ -2145,6 +2397,8 @@ def main() -> int:
         "search",
         "pin",
         "pin-thread",
+        "rescue-visible",
+        "clone-visible",
         "-h",
         "--help",
     }

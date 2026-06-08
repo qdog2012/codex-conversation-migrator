@@ -11,11 +11,12 @@ This utility works with the local Codex data directory (`CODEX_HOME` or `~/.code
 - Repair project history indexes, legacy thread source metadata in both SQLite and session files, and missing project workspace roots during import or local migration so projects can show and open their conversations.
 - Repair project history indexes, legacy thread source metadata in both SQLite and session files, and missing project workspace roots directly without changing providers.
 - Search local thread metadata and pin readable threads that still do not appear through the normal project/sidebar list.
+- Create a new visible copy of a readable thread when the original thread exists but Codex no longer shows it in normal project/sidebar lists.
 - Rewrite existing local conversations from one provider to another, such as `crs` to `openai`.
 
-> This is an unofficial local data migration helper. Close Codex App before running export, import, migration, repair, or pin commands. Codex keeps some sidebar state in memory while it is running, and may overwrite external repairs when it exits.
+> This is an unofficial local data migration helper. Close Codex App before running export, import, migration, repair, pin, or rescue commands. Codex keeps some sidebar state in memory while it is running, and may overwrite external repairs when it exits.
 
-Mutating commands (`migrate`, `import`, `repair-indexes`, and `pin`) refuse to run while a `Codex.exe` process is detected. Close Codex App completely first. Use `--force-while-running` only when you intentionally accept that Codex may overwrite external state changes.
+Mutating commands (`migrate`, `import`, `repair-indexes`, `pin`, and `rescue-visible`) refuse to run while a `Codex.exe` process is detected. Close Codex App completely first. Use `--force-while-running` only when you intentionally accept that Codex may overwrite external state changes.
 
 ## Requirements
 
@@ -148,6 +149,22 @@ To remove a thread from pinned threads:
 
 ```powershell
 python codex_conversation_migrator.py pin --unpin 019dd2bd-f4a0-7121-8fbc-aa2129dabc4f
+```
+
+### Create a visible copy of a hidden-but-readable thread
+
+If a thread is readable by ID but still does not show in the project list, search, or pinned list, create a new visible copy:
+
+```powershell
+python codex_conversation_migrator.py rescue-visible 019dd2bd-f4a0-7121-8fbc-aa2129dabc4f
+```
+
+This does not overwrite the original thread. It copies the session JSONL to a new generated thread ID, inserts a new SQLite thread row with current timestamps, attaches it to the same project root, and pins the copy by default.
+
+To avoid pinning the copy:
+
+```powershell
+python codex_conversation_migrator.py rescue-visible 019dd2bd-f4a0-7121-8fbc-aa2129dabc4f --no-pin
 ```
 
 ## Custom Codex Home
