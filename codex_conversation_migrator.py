@@ -580,6 +580,51 @@ def migrate_local_jsonl(base: Path, old_provider: str, new_provider: str) -> tup
     return checked, changed, skipped
 
 
+def repair_thread_sources(
+    base: Path, thread_ids: set[str] | None = None, default_source: str = "user"
+) -> int:
+    state_db = base / "state_5.sqlite"
+    if not state_db.exists():
+        return 0
+
+    con = sqlite3.connect(state_db)
+    try:
+        if not table_exists(con, "threads"):
+            return 0
+        cols = table_columns(con, "threads")
+        if "thread_source" not in cols:
+            return 0
+
+        if thread_ids is None:
+            cur = con.execute(
+                "update threads set thread_source = ? "
+                "where thread_source is null or thread_source = ''",
+                (default_source,),
+            )
+            con.commit()
+            return cur.rowcount if cur.rowcount is not None and cur.rowcount > 0 else 0
+
+        changed = 0
+        ids = list(thread_ids)
+        for start in range(0, len(ids), 500):
+            chunk = ids[start : start + 500]
+            if not chunk:
+                continue
+            cur = con.execute(
+                "update threads set thread_source = ? "
+                "where id in "
+                f"({','.join('?' for _ in chunk)}) "
+                "and (thread_source is null or thread_source = '')",
+                (default_source, *chunk),
+            )
+            if cur.rowcount is not None and cur.rowcount > 0:
+                changed += cur.rowcount
+        con.commit()
+        return changed
+    finally:
+        con.close()
+
+
 def migrate_local_provider(args: argparse.Namespace) -> int:
     if args.old_provider == args.new_provider:
         print("old_provider and new_provider are the same; nothing to do.", file=sys.stderr)
@@ -604,6 +649,7 @@ def migrate_local_provider(args: argparse.Namespace) -> int:
     if not args.no_set_config:
         config_changed = set_config_provider(base, args.new_provider)
     index_repairs = repair_project_history_indexes(base)
+    thread_source_repairs = repair_thread_sources(base)
 
     jsonl_counts = provider_counts_from_jsonl(base)
     db_counts = provider_counts_from_state(base / "state_5.sqlite")
@@ -621,6 +667,7 @@ def migrate_local_provider(args: argparse.Namespace) -> int:
     print(f"JSONL changed: {jsonl_changed}")
     print(f"JSONL skipped/unreadable: {jsonl_skipped}")
     print(f"Project history index entries repaired: {index_repairs}")
+    print(f"Thread source rows repaired: {thread_source_repairs}")
     print(f"config.toml set to new provider: {config_changed}")
     print(f"DB provider counts: {db_counts}")
     print(f"JSONL provider counts: {jsonl_counts}")
@@ -637,6 +684,7 @@ def repair_indexes_command(args: argparse.Namespace) -> int:
 
     backup_dir = make_target_backup(base, "repair-indexes")
     changed = repair_project_history_indexes(base)
+    thread_source_repairs = repair_thread_sources(base)
 
     print(f"Backup: {backup_dir}")
     print(f"Backup zip: {backup_dir}.zip")
@@ -644,6 +692,7 @@ def repair_indexes_command(args: argparse.Namespace) -> int:
     print("Project history index repair complete.")
     print(f"Codex home: {base}")
     print(f"Global state entries repaired: {changed}")
+    print(f"Thread source rows repaired: {thread_source_repairs}")
     print()
     print("Restart Codex App after repair.")
     return 0
@@ -1428,6 +1477,7 @@ def import_package(args: argparse.Namespace) -> int:
         global_changes = merge_global_state(
             base, package, imported_ids, id_to_cwd_path
         )
+        thread_source_repairs = repair_thread_sources(base, imported_ids)
 
     config_changed = False
     if not args.no_set_config:
@@ -1456,6 +1506,7 @@ def import_package(args: argparse.Namespace) -> int:
     print(f"Goal rows imported: {goal_rows}")
     print(f"Session index rows appended/replaced: {index_rows}")
     print(f"Global state entries merged/repaired: {global_changes}")
+    print(f"Thread source rows repaired: {thread_source_repairs}")
     print(f"config.toml set to provider: {config_changed}")
     print()
     print("Restart Codex App after import.")
