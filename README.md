@@ -10,9 +10,10 @@ This utility works with the local Codex data directory (`CODEX_HOME` or `~/.code
 - Merge duplicate thread IDs safely when importing the same conversation more than once.
 - Repair project history indexes, legacy thread source metadata in both SQLite and session files, and missing project workspace roots during import or local migration so projects can show and open their conversations.
 - Repair project history indexes, legacy thread source metadata in both SQLite and session files, and missing project workspace roots directly without changing providers.
+- Search local thread metadata and pin readable threads that still do not appear through the normal project/sidebar list.
 - Rewrite existing local conversations from one provider to another, such as `crs` to `openai`.
 
-> This is an unofficial local data migration helper. Close Codex App before running export, import, migration, or repair commands. Codex keeps some sidebar state in memory while it is running, and may overwrite external repairs when it exits.
+> This is an unofficial local data migration helper. Close Codex App before running export, import, migration, repair, or pin commands. Codex keeps some sidebar state in memory while it is running, and may overwrite external repairs when it exits.
 
 ## Requirements
 
@@ -118,6 +119,32 @@ python codex_conversation_migrator.py repair
 ```
 
 This rebuilds project assignment state and projectless output-directory hints from `state_5.sqlite` and `.codex-global-state.json`, fills missing `thread_source` values with `user` in SQLite and session metadata, and patches older project session files that are missing `workspace_roots`, without changing providers.
+
+### Pin a readable thread that still does not show
+
+Some older threads can be readable by thread ID but still fail to appear through the normal project/sidebar list. Search metadata first:
+
+```powershell
+python codex_conversation_migrator.py search IndustryResearch
+```
+
+Then pin the thread ID:
+
+```powershell
+python codex_conversation_migrator.py pin 019dd2bd-f4a0-7121-8fbc-aa2129dabc4f
+```
+
+The `pin` command also accepts a rollout JSONL path and extracts the thread ID from the filename:
+
+```powershell
+python codex_conversation_migrator.py pin C:\Users\Administrator\.codex\sessions\2026\04\28\rollout-2026-04-28T14-19-17-019dd2bd-f4a0-7121-8fbc-aa2129dabc4f.jsonl
+```
+
+To remove a thread from pinned threads:
+
+```powershell
+python codex_conversation_migrator.py pin --unpin 019dd2bd-f4a0-7121-8fbc-aa2129dabc4f
+```
 
 ## Custom Codex Home
 

@@ -24,10 +24,13 @@ Examples:
 
     # Repair local Codex sidebar/project history indexes without changing providers.
     python codex_conversation_migrator.py repair-indexes
+    # Find and pin a readable thread that still does not appear in normal lists.
+    python codex_conversation_migrator.py search IndustryResearch
+    python codex_conversation_migrator.py pin 019dd2bd-f4a0-7121-8fbc-aa2129dabc4f
 
 The script uses CODEX_HOME when set; otherwise it uses ~/.codex.
-Close Codex App before export/import/migration/repair so it does not overwrite
-the repaired UI state when it exits.
+Close Codex App before export/import/migration/repair/pin so it does not
+overwrite the repaired UI state when it exits.
 """
 
 from __future__ import annotations
@@ -59,16 +62,25 @@ BACKUP_FILES = (
 WORKSPACE_MANIFEST = "workspace_manifest.json"
 LOCAL_THREAD_KEY_PREFIX = "local:"
 PROJECTLESS_THREAD_IDS_KEY = "projectless-thread-ids"
+PINNED_THREAD_IDS_KEY = "pinned-thread-ids"
 THREAD_WORKSPACE_ROOT_HINTS_KEY = "thread-workspace-root-hints"
 THREAD_PROJECTLESS_OUTPUT_DIRECTORIES_KEY = "thread-projectless-output-directories"
 THREAD_PROJECT_ASSIGNMENTS_KEY = "thread-project-assignments"
 SIDEBAR_PROJECT_THREAD_ORDERS_KEY = "sidebar-project-thread-orders"
 WORKSPACE_ROOT_OPTIONS_KEY = "electron-saved-workspace-roots"
 PROJECT_ORDER_KEY = "project-order"
+THREAD_ID_PATTERN = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
 
 
 def safe_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._-") or "value"
+
+
+def extract_thread_id(value: str) -> str | None:
+    match = THREAD_ID_PATTERN.search(value)
+    return match.group(0).lower() if match else None
 
 
 def now_stamp() -> str:
@@ -916,6 +928,150 @@ def repair_indexes_command(args: argparse.Namespace) -> int:
     print(f"Project workspace root JSONL lines repaired: {workspace_lines_repaired}")
     print()
     print("Restart Codex App after repair.")
+    return 0
+
+
+def search_threads_command(args: argparse.Namespace) -> int:
+    base = codex_home(args.codex_home)
+    db_path = base / "state_5.sqlite"
+    if not db_path.exists():
+        print(f"Codex state database does not exist: {db_path}", file=sys.stderr)
+        return 2
+
+    query = f"%{args.query}%"
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(threads)")}
+    search_columns = [
+        col
+        for col in ("id", "title", "preview", "first_user_message", "cwd", "model_provider")
+        if col in columns
+    ]
+    if not search_columns:
+        print("Could not find searchable thread columns.", file=sys.stderr)
+        conn.close()
+        return 2
+
+    select_columns = [
+        "id",
+        "title" if "title" in columns else "'' AS title",
+        "preview" if "preview" in columns else "'' AS preview",
+        "cwd" if "cwd" in columns else "'' AS cwd",
+        "model_provider" if "model_provider" in columns else "'' AS model_provider",
+        "source" if "source" in columns else "'' AS source",
+        "thread_source" if "thread_source" in columns else "'' AS thread_source",
+        "archived" if "archived" in columns else "0 AS archived",
+        "updated_at" if "updated_at" in columns else "0 AS updated_at",
+    ]
+    where = " OR ".join(f"{col} LIKE ?" for col in search_columns)
+    sql = f"SELECT {', '.join(select_columns)} FROM threads WHERE ({where})"
+    params: list[Any] = [query] * len(search_columns)
+    if not args.include_archived and "archived" in columns:
+        sql += " AND COALESCE(archived, 0) = 0"
+    if "updated_at" in columns:
+        sql += " ORDER BY updated_at DESC"
+    if args.limit:
+        sql += " LIMIT ?"
+        params.append(args.limit)
+
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+
+    if not rows:
+        print("No matching threads.")
+        return 0
+
+    for row in rows:
+        updated = row["updated_at"]
+        if isinstance(updated, int) and updated > 0:
+            updated_text = datetime.fromtimestamp(updated).isoformat(timespec="seconds")
+        else:
+            updated_text = str(updated)
+        print(row["id"])
+        print(f"  title: {row['title']}")
+        print(f"  provider/source: {row['model_provider']} / {row['source']}")
+        print(f"  thread_source/archived: {row['thread_source']} / {row['archived']}")
+        print(f"  updated_at: {updated_text}")
+        print(f"  cwd: {path_from_db(row['cwd']) or row['cwd']}")
+        preview = row["preview"]
+        if preview and preview != row["title"]:
+            print(f"  preview: {preview}")
+        print()
+    return 0
+
+
+def pin_threads_command(args: argparse.Namespace) -> int:
+    base = codex_home(args.codex_home)
+    if not base.exists():
+        print(f"Codex home does not exist: {base}", file=sys.stderr)
+        return 2
+
+    thread_ids: list[str] = []
+    for value in args.thread_ids:
+        thread_id = extract_thread_id(value)
+        if thread_id is None:
+            print(f"Could not parse thread id from: {value}", file=sys.stderr)
+            return 2
+        if thread_id not in thread_ids:
+            thread_ids.append(thread_id)
+
+    existing_ids: set[str] = set()
+    db_path = base / "state_5.sqlite"
+    if db_path.exists() and thread_ids:
+        placeholders = ",".join("?" for _ in thread_ids)
+        conn = sqlite3.connect(db_path)
+        existing_ids = {
+            row[0]
+            for row in conn.execute(
+                f"SELECT id FROM threads WHERE id IN ({placeholders})", thread_ids
+            )
+        }
+        conn.close()
+
+    missing = [thread_id for thread_id in thread_ids if thread_id not in existing_ids]
+    target_ids = [thread_id for thread_id in thread_ids if thread_id in existing_ids]
+    if missing:
+        print("Thread ids not found in state_5.sqlite:", file=sys.stderr)
+        for thread_id in missing:
+            print(f"  {thread_id}", file=sys.stderr)
+    if not target_ids:
+        print("No valid thread ids to update.", file=sys.stderr)
+        return 2
+
+    state_path = base / ".codex-global-state.json"
+    state = load_json_file(state_path)
+    current = state.get(PINNED_THREAD_IDS_KEY)
+    pinned = [item for item in current if isinstance(item, str)] if isinstance(current, list) else []
+    before = list(pinned)
+
+    if args.unpin:
+        remove_ids = set(target_ids)
+        pinned = [thread_id for thread_id in pinned if thread_id not in remove_ids]
+    else:
+        seen = set(pinned)
+        for thread_id in target_ids:
+            if thread_id not in seen:
+                pinned.append(thread_id)
+                seen.add(thread_id)
+
+    if pinned == before:
+        action = "unpinned" if args.unpin else "pinned"
+        print(f"No changes. Requested threads are already {action}.")
+        return 0
+
+    backup_dir = make_target_backup(base, "pin-threads")
+    state[PINNED_THREAD_IDS_KEY] = pinned
+    save_json_file(state_path, state)
+
+    action = "Unpinned" if args.unpin else "Pinned"
+    print(f"Backup: {backup_dir}")
+    print(f"Backup zip: {backup_dir}.zip")
+    print()
+    print(f"{action} thread ids:")
+    for thread_id in target_ids:
+        print(f"  {thread_id}")
+    print()
+    print("Restart Codex App after changing pinned threads.")
     return 0
 
 
@@ -1777,6 +1933,49 @@ def build_parser() -> argparse.ArgumentParser:
     )
     repair_parser.set_defaults(func=repair_indexes_command)
 
+    search_parser = subparsers.add_parser(
+        "search",
+        help="Search local thread metadata and print matching thread ids.",
+    )
+    search_parser.add_argument("query", help="Text to search in id, title, preview, cwd, or provider.")
+    search_parser.add_argument(
+        "--codex-home",
+        help="Target Codex home. Defaults to CODEX_HOME or ~/.codex.",
+    )
+    search_parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Maximum matches to print. Defaults to 20.",
+    )
+    search_parser.add_argument(
+        "--include-archived",
+        action="store_true",
+        help="Include archived threads in search results.",
+    )
+    search_parser.set_defaults(func=search_threads_command)
+
+    pin_parser = subparsers.add_parser(
+        "pin",
+        aliases=["pin-thread"],
+        help="Pin readable threads that do not appear in the normal sidebar/search list.",
+    )
+    pin_parser.add_argument(
+        "thread_ids",
+        nargs="+",
+        help="Thread ids or rollout JSONL paths containing thread ids.",
+    )
+    pin_parser.add_argument(
+        "--codex-home",
+        help="Target Codex home. Defaults to CODEX_HOME or ~/.codex.",
+    )
+    pin_parser.add_argument(
+        "--unpin",
+        action="store_true",
+        help="Remove the thread ids from pinned threads instead of adding them.",
+    )
+    pin_parser.set_defaults(func=pin_threads_command)
+
     export_parser = subparsers.add_parser(
         "export", help="Export all local Codex conversations from all providers."
     )
@@ -1844,7 +2043,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    legacy_commands = {"migrate", "export", "import", "repair-indexes", "repair", "-h", "--help"}
+    legacy_commands = {
+        "migrate",
+        "export",
+        "import",
+        "repair-indexes",
+        "repair",
+        "search",
+        "pin",
+        "pin-thread",
+        "-h",
+        "--help",
+    }
     if len(sys.argv) >= 3 and sys.argv[1] not in legacy_commands and not sys.argv[1].startswith("-"):
         sys.argv.insert(1, "migrate")
     parser = build_parser()
